@@ -1,0 +1,398 @@
+#/bin/bash
+#====================================================================
+# NAME      :   ddim(DD Image Modificator)
+# AUTHOR    :   Andrys Jiri
+# DATE      :   2019.07.23
+VERSION='0.1'
+#
+# DEPENDENCIES :
+#               Binaries: bash, ls, mkdir, rmdir, cp, sudo, grep, egrep, 
+#                         awk, du, df, tar, 
+#                         losetup, kpartx, mount, dd, e2fsck, parted
+#                         fdisk
+#
+#
+# DESCRIPTION :
+#               Add data to raw(dd) image of sd card, 
+#               if necessary resize partition 
+#
+#
+# TESTED ENV  :
+#              "Ubuntu 16.04.6 LTS"    
+#
+#
+#
+#====================================================================
+
+
+
+
+expanypart() {
+    local _ddimgfile=$1
+    local _expsizeMB=$2
+    local _exppartnum=$3
+    
+
+
+
+
+
+
+}
+
+
+
+explstpart() {
+    local _ddimgfile=$1
+    local _expsizeMB=$2
+    local _lastpartn=$3
+    
+    #_lastpartn starts from 0, but parted is counting from 1 ..
+    _lastpartn=$((${_lastpartn}+1))
+    
+    
+    echo -e "\nExpanding raw-image[+${_expsizeMB}MB]:"
+    dd if=/dev/zero bs=1M count="${_expsizeMB}" status=progress >> "${_ddimgfile}"
+    _tmp=$?
+    if [ ! ${_tmp} -eq 0 ]; then
+      echo -e "\nError: dd if=/dev/zero bs=1M count="${_expsizeMB}" status=progress >> "${_ddimgfile}" "
+      return 1
+    else
+      echo ">OK"
+    fi
+    sync
+    
+    
+    partendMB=$(parted ${_ddimgfile} unit MB print | awk -v partn=${_lastpartn} '{ if(flg==1){i++;if(i==partn){print $3};}; if( match($0,"Number.*Start.*End") ){flg=1; }   }')
+    partendMB=${partendMB//MB/}
+    ENDpoint=$((${partendMB}+${_expsizeMB}))
+    
+    echo -e "\nResizing partition of raw-image:"
+    bla=$(sudo parted "${_ddimgfile}" resizepart "${_lastpartn}" "${ENDpoint}MB" )
+    _tmp=$?
+    if [ ! ${_tmp} -eq 0 ]; then
+      echo -e "\nError: sudo parted "${_ddimgfile}" resizepart "${_lastpartn}" "${ENDpoint}MB" "
+      return 2
+    else
+      echo ">OK"
+    fi
+    sync
+    
+    echo -e "\nMapping partion :"
+    bla=$(sudo kpartx -a "${_ddimgfile}")
+    _tmp=$?
+    if [ ! ${_tmp} -eq 0 ]; then
+      echo -e "\nError: sudo kpartx -a "${_ddimgfile}" "
+      return 3
+    else
+      echo ">OK"
+    fi
+    
+    sleep 0.5
+    
+    #/dev/loopX
+    loopdev=$(losetup | grep ${_ddimgfile##*/} | awk '{print $1}')
+    mapperpart="${loopdev}p${_lastpartn}"
+    mapperpart="/dev/mapper/${mapperpart##*/}"
+    
+    #echo "-${mapperpart}-"
+    #read -p ">"
+    if [ ! -e "${mapperpart}" ]; then
+      sudo kpartx -d "${_ddimgfile}"  
+      echo -e "\nError: Unable to find mapper device. Exiting \n"
+      return 4
+    fi
+    
+    echo -e "\nChecking partion:"
+    errcnt=1
+    #after every first resize(errcnt=1) fix is necessary
+    while true; do
+        bla=$(sudo e2fsck -f -y -v -C 0 "${mapperpart}")
+        _tmp=$?
+        sync
+        if [ ! ${_tmp} -eq 0 ]; then
+        
+            if [ ${errcnt} -eq 0 ]; then
+                echo -e "\nError: Unable to find mapper device. Exiting \n"
+                return 5
+            else
+                echo ">Warning:Fixing"    
+            fi
+        
+            ((errcnt--))
+        
+        else
+            echo ">OK"
+            break;        
+        fi
+    done
+    
+    sync
+    
+    echo -e "\nResizing file system:"    
+    bla=$(sudo resize2fs -p "${mapperpart}")
+    _tmp=$?
+    if [ ! ${_tmp} -eq 0 ]; then
+      echo -e "\nError: sudo resize2fs -p "${mapperpart}" "
+      return 6
+    else
+      echo ">OK"
+    fi
+    
+    sync
+    
+    echo -e "\nUnmapping partion :"
+    bla=$(sudo kpartx -d "${_ddimgfile}")
+    _tmp=$?
+    if [ ! ${_tmp} -eq 0 ]; then
+      echo -e "\nError: sudo kpartx -d "${_ddimgfile}" "
+      return 7
+    else
+      echo ">OK"
+    fi
+    sleep 0.5
+    
+    return 0
+
+}
+
+
+mountandcheckfreespace() {
+    local _dirorarchfile=$1
+    local _ddimgfile=$2
+    local _startbytesec=$3
+    local _mntpoint=$4
+    local _ret=$5
+    
+    
+    #check if we can fitin
+    if [ -d ${_dirorarchfile} ]; then
+        _sizeMB=$(du -BM -L -d0 "${_dirorarchfile}" | awk '{ print $1 }')
+        _sizeMB=${_sizeMB//M/}
+    else
+        _sizeMB=$(tar tvf "${_dirorarchfile}" | awk '{s+=$3} END{print (s/(1024*1024))}')
+        _sizeMB=${_sizeMB%%[,.]*}
+    fi
+    #echo _sizeMB=-${_sizeMB}-
+    
+    echo -e "\nCheck available space, mount:"
+    sudo mount -o loop,offset="${_startbytesec}" "${_ddimgfile}" "${_mntpoint}"
+    _tmp=$?
+    if [ ! ${_tmp} -eq 0 ]; then
+      echo -e "\nError: sudo mount -o loop,offset="${_startbytesec}" "${_ddimgfile}" "${_mntpoint}""
+      return 1
+    else
+      echo ">OK"
+    fi
+
+    _freespaceb=$(df "${_mntpoint}" -BM | awk 'END{print $4}')
+    _freespaceMB=$(( ${_freespaceb//M/} - 2 ));
+    #for safety reasons we distract and due to ints  -> 2 MB
+    #echo _freespaceMB=-${_freespaceMB}-
+    #read -p ">"
+    
+    echo -e "\nCheck available space, umount:"
+    sudo umount "${_mntpoint}"
+    _tmp=$?
+    if [ ! ${_tmp} -eq  0 ]; then
+      echo -e "\nError: sudo umount "${_mntpoint}""
+      return 2
+    else
+      echo ">OK"
+    fi    
+    
+    _expsize=$((${_sizeMB}-${_freespaceMB}))
+    #echo _expsize=-${_expsize}-
+    
+    #only ints, ignoring differences <2MB
+    if [ ${_sizeMB} -gt ${_freespaceMB} ]; then 
+      _expsize=$((${_sizeMB}-${_freespaceMB}))
+      eval ${_ret}=${_expsize}
+      return 1
+    fi
+    
+    return 0
+}
+
+
+
+
+trapclean(){
+    
+    echo -e "\nCleaning:\n"
+    sleep 0.1
+    bla=$(sudo umount ${MNTPOINT} 2>/dev/null)
+    bla=$(sudo kpartx -d ${RAWIMAGEFILE} 2>/dev/null)
+    sleep 0.5
+    
+    while true; do
+      tst1=$(mount | grep ${MNTPOINT})
+      if [ ! -z "${RAWIMAGEFILE}" ]; then
+          tst2=$(mount | grep ${RAWIMAGEFILE##*/})
+          tst3=$(losetup | grep "${RAWIMAGEFILE}" )
+      fi
+      
+      if [ ! -z "${tst1}" ] || [ ! -z "${tst2}" ] || [ ! -z "${tst3}" ]; then
+      
+        echo -e "\nError: Raw-image is used !"
+        echo -e "       Press Enter to try again"
+        
+        bla=$(sudo umount ${MNTPOINT} 2>/dev/null)
+        
+        bla=$(sudo kpartx -d ${RAWIMAGEFILE} 2>/dev/null)
+
+        sleep 0.5
+        
+        read -p ">"
+        continue
+      else
+        break;
+      fi
+    done
+    
+    [ -d ${MNTPOINT} ] && rmdir "${MNTPOINT}"
+}
+
+main() {
+
+    MNTPOINT=$(mktemp -d)
+    
+    trap trapclean SIGTERM SIGHUP EXIT
+
+    echo -e "\nEnter path to raw-image file: "
+    read -e  -p ">" RAWIMAGEFILE
+    if [ ! -e "${RAWIMAGEFILE}" ]; then
+        echo -e "Error:File does not exist ! Exiting \n"
+        unset RAWIMAGEFILE
+        return 1
+    fi
+
+    echo -e "\nSelect partition number[0-X]:"
+    fdisk -l ${RAWIMAGEFILE} | awk  '{ if(flg==1){print  i++ "  " $0}; if( match($0,"Device") ){flg=1; print "   " $0 }   }'
+    read -e  -p ">" SPARTNB
+
+    echo -e "\nEnter tar archive or some directory: "
+    read -e  -p ">" DIRORARCH
+    
+    if [ ! -e "${DIRORARCH}" ]; then
+        echo -e "Error:Archive or directory does not exist ! Exiting \n"
+        return 2
+    fi
+    
+
+    tmp=$(fdisk -l ${RAWIMAGEFILE} | grep -i sector.*size.*: )
+
+    secsize=${tmp##*/}
+    secsize=${secsize//[!0-9]/}
+    startsec=$(fdisk -l ${RAWIMAGEFILE} | awk -v partn=${SPARTNB} '{ if(flg==1){if(i==partn){print $2};i++;}; if( match($0,"Device") ){flg=1; }   }')
+    LASTPARTN=$(fdisk -l ${RAWIMAGEFILE} | awk '{ if(flg==1){i++}; if( match($0,"Device.*Boot.*Start.*End.*Size") ){flg=1; }   }END{print i-1}')
+    STARTBYTESEC=$((${startsec}*${secsize}))
+
+    
+    mountandcheckfreespace "${DIRORARCH}" "${RAWIMAGEFILE}" "${STARTBYTESEC}" "${MNTPOINT}" ret_expsize
+    
+    _ret=$?
+    if [ ! "${_ret}" -eq 0 ]; then
+    
+        echo -e "\nWarning: Not enought available space ! Another ${ret_expsize} MB is necessary on SD-CARD "
+        
+        if [ ! ${SPARTNB} -eq ${LASTPARTN} ]; then
+            echo -e "Error: This version supports expansion of raw-image only in case of last partition. Exiting \n"
+            return 3
+        else
+            #expand last partition
+            
+            #1.25x resize 
+            expsize=$((${ret_expsize}*5/4))
+            
+            echo -e "\n Resize SD-CARD ? [y/n]"
+            
+            read -p " >" yn      
+            yn=${yn% *}; yn=${yn#* }
+            if [[ ${yn} =~ ^(y|Y|yes|Yes)$ ]]; then 
+            
+                explstpart "${RAWIMAGEFILE}" "${expsize}" "${LASTPARTN}"
+                _ret=$?
+                if [ ! ${_ret} -eq 0 ]; then
+                    echo -e "Error: Expandinf raw-image was not successful! Exiting \n"
+                    return 4
+                fi
+                
+                mountanddatacopy "${DIRORARCH}" "${MNTPOINT}" "${RAWIMAGEFILE}" "${STARTBYTESEC}"
+                _ret=$? 
+                [ ${_ret} -eq 0 ] && echo -e "\n>OK"
+                [ ! ${_ret} -eq 0 ] && echo -e "\n>ERROR" 
+                return 0
+                
+            else
+                return 6
+            fi
+        fi  
+  
+    else
+        #Plenty of space on raw-image
+        
+        mountanddatacopy "${DIRORARCH}" "${MNTPOINT}" "${RAWIMAGEFILE}" "${STARTBYTESEC}"
+        _ret=$? 
+        [ ${_ret} -eq 0 ] && echo -e "\n>OK"
+        [ ! ${_ret} -eq 0 ] && echo -e "\n>ERROR"
+        
+        return 0
+  
+    fi
+    #mountandcheckfreespace
+
+
+}
+
+
+mountanddatacopy() {
+    local _fromarchiveordir=$1
+    local _mntpoint=$2
+    local _ddimgfile=$3
+    local _startbytesec=$4
+    
+    echo -e "\nMount:"
+    sudo mount -o loop,offset="${_startbytesec}" "${_ddimgfile}" "${_mntpoint}"
+    _ret=$?
+    [ ! ${_ret} -eq 0 ] && return 1
+    
+    
+    if [ -d "${_fromarchiveordir}" ]; then
+        echo -e "\nCopy data to raw image:"
+        
+        frmtmp=${_fromarchiveordir%%/}/*
+        #echo sudo cp -rf  "${frmtmp}" "${_mntpoint}"
+        #read -p "  >" yn
+        sudo cp -rf  ${frmtmp} "${_mntpoint}"
+        _ret1=$?
+        
+    else
+        echo -e "\nExtract archive to raw image:"
+        #echo sudo tar -C "${_mntpoint}" -xvf "${_fromarchiveordir}"
+        #read -p "  >" yn   
+        sudo tar -C "${_mntpoint}" -xvf "${_fromarchiveordir}"
+        _ret1=$?
+        
+    fi
+
+
+    if [ ! ${_ret1} -eq 0 ]; then
+        echo -e "Error[$_ret1]: Copying was not successful! Exiting \n"
+        bla=$(sudo umount "${_mntpoint}")
+        return 2
+    else
+        echo -e "\nUmount:"
+        bla=$(sudo umount "${_mntpoint}")
+        _ret=$?
+        if [ ! ${_ret} -eq 0 ]; then
+            echo -e "\nError: sudo umount "${_mntpoint}""
+            return 3
+        fi
+    fi
+    
+    
+    return 0
+}
+
+main
