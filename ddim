@@ -2,8 +2,8 @@
 #====================================================================
 # NAME      :   ddim(DD Image Modificator)
 # AUTHOR    :   Andrys Jiri
-# DATE      :   2019.07.23
-VERSION='0.1'
+# DATE      :   2019.10.11
+VERSION='0.02'
 #
 # DEPENDENCIES :
 #               Binaries: bash, ls, mkdir, rmdir, cp, sudo, grep, egrep, 
@@ -25,19 +25,284 @@ VERSION='0.1'
 #====================================================================
 
 
+std(){
+#start time diff
+    local _ret=$1
+    
+    local _StartDate=$(date -u -d $(date +"%T") +"%s")
+    
+    eval ${_ret}=${_StartDate}
+}
 
+ptd(){
+    local _StartDate=$1
+    
+    local _FinalDate=$(date -u -d $(date +"%T") +"%s"); timediff=$(date -u -d "0 $_FinalDate sec - $_StartDate sec" +"%H:%M:%S")
+    echo -e "\nTIMEDIFF.: $timediff"
+}
+
+
+
+create2ndpartofimage(){
+    local _ddimgfileX=$1
+    local _exppartnumX=$2
+    
+    #can be slow in mounted FS ...
+    [ ! -p cpysync ] && [ -f cpysync ] && rm cpysync
+    [ ! -p cpysync ] && { mkfifo cpysync; } || { rm cpysync; mkfifo cpysync; }
+    sync
+    
+    local _oldpartendB=$(parted -m ${_ddimgfileX} unit B print 2>/dev/null | awk -v partn=${_exppartnumX} 'BEGIN{ FS = ":" }FNR>2{ if($1==partn){ss=$3;sub(/B/,"",ss);print ss} }')
+    
+    #TODO: "bs" is too big ...  the malloc error issue can appear without detected error, same as before...?? !!
+    #TODO: Make some part of process such as this one in parallel with others .... 
+    dd if=${_ddimgfile} of=${RAWIMG_2NEW} bs=$((${_oldpartendB}+1)) skip=1 conv=sparse status=progress 
+    [ ! $? -eq 0 ] && { echo -e "ERROR: dd if=${_ddimgfile} of=${RAWIMG_2NEW} bs=$((${_oldpartendB}+1)) skip=1 status=progress . \nExiting"; echo "4 finished" >cpysync; return 4; }
+    sync
+    
+    echo "0 finished" >cpysync
+}
+
+#Old parted version included function for moving partitions, 
+#unfortunatelly, in ver. 3 devel team remove it due to maitaining dificulties
+#no tool support it from cmd line ...
 
 expanypart() {
     local _ddimgfile=$1
     local _expsizeMB=$2
+    
+    #partitions index 1-4, same as in parted
     local _exppartnum=$3
     
+    local _secsize=$4
+    
+    #partitions index 1-4, same as in parted
+    local _lastpartn=$5
+    
+    std tdtmp
+    
+    local _expsizeBytes=$((${_expsizeMB}*1024*1024))
+     
+    #TODO: Optimalization: Steps 1,5,7,8 are slowest ...
+    
+    echo -e "\nExpanding partion [${_exppartnum}]: Step 0/8"
+    
+    create2ndpartofimage "${_ddimgfile}" "${_exppartnum}" &
+    
+    echo -e "\nExpanding partion [${_exppartnum}]: Step 1/8"
+    #12s
+    
+    cp ${_ddimgfile} "${RAWIMG_0NEW}" --sparse=always 2>/dev/null
+    
+    
+    #remove every partition up to one we want to expand 
+    #TODO:? Do not ignore error in case that partitions are not in order ...
+    for((i=$((${_exppartnum}+1));i<=${_lastpartn};i++)); do
+        parted "${RAWIMG_0NEW}" rm ${i} 2>/dev/null
+        sync
+        sleep 1
+    done
+    
+    ptd ${tdtmp}
+    #echo "waiting ....."; read -p ">"
+    std tdtmp
+    
+    echo -e "\nExpanding partion [${_exppartnum}]: Step 2/8"
+    
+    local _expsizeS=$((${_expsizeBytes}/${_secsize}))
+    dd if=/dev/zero bs=${_secsize} count=${_expsizeS} status=progress >>${RAWIMG_0NEW}
 
+    
+    [ ! $? -eq 0 ] && { echo -e "ERROR: dd if=/dev/zero bs=${_secsize} count=${_expsizeS} status=progress >>${RAWIMG_0NEW} . \nExiting"; return 1; }
+    
+    ptd ${tdtmp}    
+    #echo "waiting ....."; read -p ">"
+    std tdtmp
+    
+    
+    echo -e "\nExpanding partion [${_exppartnum}]: Step 3/8"
+    
+    local _exppartendB=$(parted -m ${RAWIMG_0NEW} unit B print 2>/dev/null | awk -v partn=${_exppartnum} 'BEGIN{ FS = ":" }FNR>2{ if($1==partn){ss=$3;sub(/B/,"",ss);print ss} }')
+    local _exppartendB_new=$(( ${_exppartendB}+${_expsizeBytes} ))
+    sudo parted ${RAWIMG_0NEW} resizepart ${_exppartnum} ${_exppartendB_new}B 2>/dev/null
+    
+    [ ! $? -eq 0 ] && { echo -e "ERROR: sudo parted ${RAWIMG_0NEW} resizepart ${_exppartnum} ${_exppartendB_new}B 2>/dev/null . \nExiting"; return 2; }
+    
+    ptd ${tdtmp}
+    #echo "waiting ....."; read -p ">"
+    std tdtmp
+    #ok
+    
+    
+    echo -e "\nExpanding partion [${_exppartnum}]: Step 4/8"
+    
+    local _loopn=$(sudo kpartx -asv ${RAWIMG_0NEW} | awk '{ for(i=1;i<NF;i++){if(match($i,"loop")){  str=$i; sub(/loop/,"",str); print substr(str,1,index(str,"p")-1); exit } }  }')
+    if [ -z ${_loopn} ] ; then
+        echo -n "Error: Unable to find loop. Exiting "
+        return 1
+    fi 
+    
+    local _parttype=$(parted -m ${RAWIMG_0NEW} unit MB print 2>/dev/null | awk -v partn=${_exppartnum} 'BEGIN{ FS = ":" }FNR>2{ if($1==partn){print $5} }')
+    
+    local _mapperdev="/dev/mapper/loop${_loopn}p${_exppartnum}"
+    
+    if [ -z ${_parttype} ] || [[ ! "${_parttype}" == "ext"*  ]]; then
+        #Tool will not support FAT at all
+        #not able to detect fat system correctly -> end up as fat12 fs is not supported by fatresize ... but fdisk give us ->C-> W95 FAT32 (LBA)
+        #sudo ln /dev/loopY /dev/mapper/loopYp
+        #sudo dosfsck -w -r -l -a -v -t /dev/mapper/loop0pX
+        #sudo fatresize -s 1073741824  /dev/mapper/loop0pX
+        echo -n "Error: Resizing non-extX partition is not supported in this version. Exiting "
+        return 3
+    else 
+        #echo "waiting ....._mapperdev=${_mapperdev}"; read -p ">"
+        bla=$(sudo e2fsck -f -y -v -C 0 "${_mapperdev}" 2>/dev/null)
+        bla=$(sudo resize2fs -p "${_mapperdev}" 2>/dev/null)
+    fi
+    
+    sync
+    sleep 1
+    
+    bla=$(sudo kpartx -dsv "${RAWIMG_0NEW}" 2>/dev/null)
+    
+    #ptd ${tdtmp}
+    #std tdtmp    
+    
+    
+    #--------------------------------------------------------
+    #echo -e "\nExpanding partion [${_exppartnum}]: Step 5/9"
+    
+    #local _oldpartendB=$(parted -m ${_ddimgfile} unit B print 2>/dev/null | awk -v partn=${_exppartnum} 'BEGIN{ FS = ":" }FNR>2{ if($1==partn){ss=$3;sub(/B/,"",ss);print ss} }')
+    
+    #TODO: "bs" is too big ...  the malloc error issue can appear without detected error, same as before...?? !!
+    #TODO: Make some part of process such as this one in parallel with others .... 
+    #dd if=${_ddimgfile} of=${RAWIMG_2NEW} bs=$((${_oldpartendB}+1)) skip=1 conv=sparse status=progress 
+    
+    #[ ! $? -eq 0 ] && { echo -e "ERROR: dd if=${_ddimgfile} of=${RAWIMG_2NEW} bs=$((${_oldpartendB}+1)) skip=1 status=progress . \nExiting"; return 4; }
+    
+    
+    #ptd ${tdtmp}
+    #echo "waiting ....."; read -p ">"
+    #std tdtmp
+    #---------------------------------------------------------
+    
+    
+    echo -e "\nExpanding partion [${_exppartnum}]: Step 5/8"
+    #14s 17s
+    
+    for((i=$((${_exppartnum}+1));i<=${_lastpartn};i++)){
+        local _pstart=$(parted -m ${RAWIMG_0NEW} unit B print 2>/dev/null | awk -v partn=$((${i}-1)) 'BEGIN{ FS = ":" }FNR>2{ if($1==partn){ss=$3;sub(/B/,"",ss);print ss} }' )
+        #local _pstart=${_pstart//B/}
+        local _pstart=$((${_pstart}+1))
+        #pstart=2688548863+1             
+        
+        local _psize=$(parted -m ${_ddimgfile} unit B print 2>/dev/null | awk -v partn=${i} 'BEGIN{ FS = ":" }FNR>2{ if($1==partn){ss=$4;sub(/B/,"",ss);print ss} }' )
+        #local _psize=${_psize//B/}
+        #size=2147483648B
+              
+        local _pend=$((${_psize}+${_pstart}-1))
 
+        local _pfs=$(parted -m ${_ddimgfile} unit B print 2>/dev/null | awk -v partn=${i} 'BEGIN{ FS = ":" }FNR>2{ if($1==partn){ss=$5;sub(/B/,"",ss);print ss} }' )
+        
+        #sudo parted 0sdcard mkpart primary ext4 2688548864B 4836032511B
+        bla=$(sudo parted "${RAWIMG_0NEW}" mkpart primary "${_pfs}" "${_pstart}B"  "${_pend}B" 2>/dev/null)
+        
+        [ ! $? -eq 0 ] && { echo -e "ERROR: sudo parted ${RAWIMG_0NEW} mkpart primary ${_pfs} ${_pstart}B  ${_pend}B . \nExiting"; return 5; }
+        
+        #sleep 1
+        sync
 
+        #Create fs on "new/moved" partition 3(writing only proper fields in MBR,..rest will be overwritten by 1sdcard)
+        local _loopn=$(sudo kpartx -asv ${RAWIMG_0NEW} 2>/dev/null | awk '{ for(i=1;i<NF;i++){if(match($i,"loop")){  str=$i; sub(/loop/,"",str); print substr(str,1,index(str,"p")-1); exit } }  }')
+        #       
+        local _mapperdev=/dev/mapper/loop${_loopn}p${i}
+        bla=$(sudo mkfs.${_pfs} ${_mapperdev} 2>/dev/null )
+        
+        [ ! $? -eq 0 ] && { echo -e "ERROR: sudo mkfs.${_pfs} ${_mapperdev} . \nExiting"; return 6; }
+        
+        #sleep 1
+        sync
+        bla=$(sudo kpartx -dsv ${RAWIMG_0NEW} 2>/dev/null)
+        #sync
+        #unset _pstart _psize _pend _pfs _loopn _mapperdev
+    }
+    
+    ptd ${tdtmp}
+    #echo "waiting ....."; read -p ">"
+    std tdtmp
+    
+    echo -e "\nExpanding partion [${_exppartnum}]: Step 6/8"
+    #14s 16s
+    local _newpartendB=$(parted -m ${RAWIMG_0NEW} unit B print 2>/dev/null | awk -v partn=${_exppartnum} 'BEGIN{ FS = ":" }FNR>2{ if($1==partn){ss=$3;sub(/B/,"",ss);print ss} }')
+    local _newpartendB=$(( (${_newpartendB}+1)/(${_secsize}) ))
+    dd if=${RAWIMG_0NEW} of=${RAWIMG_1NEW} bs=$((${_secsize})) count=${_newpartendB}  conv=sparse status=progress
+    sync
+    
+    ptd ${tdtmp}
+    #echo "waiting ....."; read -p ">"
+    std tdtmp
+    
+    
+    echo -e "\nExpanding partion [${_exppartnum}]: Step 7/8"
+    
+    echo "  Waiting for copying"
+    ws=$(<cpysync)
+    echo "  ->Finished"
+    rm cpysync
+    echo -e "\n  Joining images:"
+    
+    cat ${RAWIMG_2NEW}>>${RAWIMG_1NEW}
+    
+    #pv command is not installed on some distross, so its better to not to use it
+    #pv ${RAWIMG_2NEW}>>${RAWIMG_1NEW}
+    
+    ptd ${tdtmp}
+    std tdtmp
+    
+    echo -e "\nExpanding partion [${_exppartnum}]: Step 8/8"
+    
+    local _loopn=$(sudo kpartx -asv ${RAWIMG_1NEW} | awk '{ for(i=1;i<NF;i++){if(match($i,"loop")){  str=$i; sub(/loop/,"",str); print substr(str,1,index(str,"p")-1); exit } }  }')
+    
+    local _flg=0
+    
+    for((i=1;i<=${_lastpartn};i++)){
+       #15s
+       #check existence of partiotion and type of fs
+       local _pfs=$(parted -m ${RAWIMG_1NEW} unit B print 2>/dev/null | awk -v partn=${i} 'BEGIN{ FS = ":" }FNR>2{ if($1==partn){print $5} }')
+       
+       if [ -z ${_pfs} ] || [[ ! "${_pfs}" == "ext"*  ]] || [  ${i} -eq ${_exppartnum}  ]; then
+         #echo "skip:$i,pfs=-${_pfs}-,exppartnum=${_exppartnum}"; 
+         continue; 
+       fi
+       
+        while true; do  
+            bla=$(sudo e2fsck -f -y -v -C 0 /dev/mapper/loop${_loopn}p${i} 2>/dev/null)
+            _ret=$?
+            #sleep 1
+            sync
+            if [ ! ${_ret} -eq 0 ]; then
+                if [ ${_flg} -eq 0 ]; then
+                    #first fail -> fix
+                    _flg=1
+                else
+                   #second fail > error
+                   echo -e "Error: Problem with partition \n       Unable to fix it, please resize partition and copy data manually. Exiting "
+                return 2;
+                fi
+            else
+                break;
+            fi 
+       done
 
+    } 
 
+    bla=$(sudo kpartx -dsv ${RAWIMG_1NEW} 2>/dev/null)
+    
+    ptd ${tdtmp}
+    std tdtmp
 
+    return 0
+    
 }
 
 
@@ -46,10 +311,6 @@ explstpart() {
     local _ddimgfile=$1
     local _expsizeMB=$2
     local _lastpartn=$3
-    
-    #_lastpartn starts from 0, but parted is counting from 1 ..
-    _lastpartn=$((${_lastpartn}+1))
-    
     
     echo -e "\nExpanding raw-image[+${_expsizeMB}MB]:"
     dd if=/dev/zero bs=1M count="${_expsizeMB}" status=progress >> "${_ddimgfile}"
@@ -62,9 +323,7 @@ explstpart() {
     fi
     sync
     
-    
-    partendMB=$(parted ${_ddimgfile} unit MB print | awk -v partn=${_lastpartn} '{ if(flg==1){i++;if(i==partn){print $3};}; if( match($0,"Number.*Start.*End") ){flg=1; }   }')
-    partendMB=${partendMB//MB/}
+    partendMB=$(parted -m ${_ddimgfile} unit MB print 2>/dev/null | awk -v partn=${_lastpartn} 'BEGIN{ FS = ":" }FNR>2{ if($1==partn){ss=$3;sub(/MB/,"",ss);print ss} }')
     ENDpoint=$((${partendMB}+${_expsizeMB}))
     
     echo -e "\nResizing partition of raw-image:"
@@ -107,7 +366,7 @@ explstpart() {
     errcnt=1
     #after every first resize(errcnt=1) fix is necessary
     while true; do
-        bla=$(sudo e2fsck -f -y -v -C 0 "${mapperpart}")
+        bla=$(sudo e2fsck -f -y -v -C 0 "${mapperpart}" 2>/dev/null)
         _tmp=$?
         sync
         if [ ! ${_tmp} -eq 0 ]; then
@@ -167,9 +426,10 @@ mountandcheckfreespace() {
     
     #check if we can fitin
     if [ -d ${_dirorarchfile} ]; then
-        _sizeMB=$(du -BM -L -d0 "${_dirorarchfile}" | awk '{ print $1 }')
+        _sizeMB=$(du -BM -L -d0 --apparent-size "${_dirorarchfile}" | awk '{ print $1 }')
         _sizeMB=${_sizeMB//M/}
     else
+        echo "archive"
         _sizeMB=$(tar tvf "${_dirorarchfile}" | awk '{s+=$3} END{print (s/(1024*1024))}')
         _sizeMB=${_sizeMB%%[,.]*}
     fi
@@ -189,6 +449,7 @@ mountandcheckfreespace() {
     _freespaceMB=$(( ${_freespaceb//M/} - 2 ));
     #for safety reasons we distract and due to ints  -> 2 MB
     #echo _freespaceMB=-${_freespaceMB}-
+    
     #read -p ">"
     
     echo -e "\nCheck available space, umount:"
@@ -203,6 +464,8 @@ mountandcheckfreespace() {
     
     _expsize=$((${_sizeMB}-${_freespaceMB}))
     #echo _expsize=-${_expsize}-
+    
+    #read -p ">"
     
     #only ints, ignoring differences <2MB
     if [ ${_sizeMB} -gt ${_freespaceMB} ]; then 
@@ -219,11 +482,20 @@ mountandcheckfreespace() {
 
 trapclean(){
     
+    [ $NO_CLEANING == "yes" ] && return 0;
+    
     echo -e "\nCleaning:\n"
     sleep 0.1
     bla=$(sudo umount ${MNTPOINT} 2>/dev/null)
     bla=$(sudo kpartx -d ${RAWIMAGEFILE} 2>/dev/null)
     sleep 0.5
+    
+    bla=$([[ ${RAWIMGARCH_EXTRACT_DIR} == /tmp/tmp.* ]] && rm -rf ${RAWIMGARCH_EXTRACT_DIR} 2>/dev/null )
+    
+    bla=$( [ -e ${RAWIMG_0NEW} ] && rm -f ${RAWIMG_0NEW} 2>/dev/null  )
+    bla=$( [ -e ${RAWIMG_1NEW} ] && rm -f ${RAWIMG_1NEW} 2>/dev/null  )
+    bla=$( [ -e ${RAWIMG_2NEW} ] && rm -f ${RAWIMG_2NEW} 2>/dev/null  )
+    bla=$( [ -p cpysync ] && rm -f cpysync 2>/dev/null  )
     
     while true; do
       tst1=$(mount | grep ${MNTPOINT})
@@ -253,95 +525,240 @@ trapclean(){
     [ -d ${MNTPOINT} ] && rmdir "${MNTPOINT}"
 }
 
+
+
+help_desc(){
+
+echo -e "\
+  Usage:  ddim OPTIONS
+
+  Copy data to SD-CARD image.
+  Resize partitions if necessary.
+  Resizig FATXX filesystems in not supported.
+  Only MBR/DOS arrangement is supported.
+  
+  Tool takes all options as cmd parameters or all options from prompts.
+  If parameter is not provided, tool will prompt user automatically.
+  
+  OPTION: --raw-image-file="SD-CARD_IMAGE_FILE" | -i="SD-CARD_IMAGE_FILE"
+  |
+  |  >Path to raw-image file(*.sdcard) or tar archive with raw-image(*.tar.xz):
+
+  OPTION: --partition-number="[1-4]PARTITION_NUMBER" | -p="[1-4]PARTITION_NUMBER"
+  |
+  |  >Partition number on sd-card image file
+  
+  OPTION: --destination-directory="DESTINATION_DIRECTORY" | -r="DESTINATION_DIRECTORY"
+  |
+  |  >Destination directory prefix on sd-card.
+
+
+  OPTION: --data="DATA2COPY" | -d="DATA2COPY"
+  |
+  |  >Data to copy on sd-card.
+  |  >Tar archive(*.tar.???) or directory 
+
+"
+}
+
+
+ver_info(){
+    echo -e ${VERSION}
+}
+
+RAWIMG_0NEW=0sdcard
+RAWIMG_1NEW=0sdcard_m
+RAWIMG_2NEW=1sdcard
+NO_PROMPT="no"
+NO_CLEANING="no"
+
 main() {
 
     MNTPOINT=$(mktemp -d)
     
+    #This is just for smooth cleaning function, user would press another set of ctrl C or Z and stop cleaning task once sudo apears 
+    sudo echo 
+    
     trap trapclean SIGTERM SIGHUP EXIT
 
-    echo -e "\nEnter path to raw-image file: "
-    read -e  -p ">" RAWIMAGEFILE
-    if [ ! -e "${RAWIMAGEFILE}" ]; then
-        echo -e "Error:File does not exist ! Exiting \n"
-        unset RAWIMAGEFILE
-        return 1
+    for arg in "$@"; do
+        case "$arg" in
+        
+            help|--help|-h|\?)
+                help_desc
+                NO_CLEANING="yes"
+                return 0;
+            ;;
+        
+            --raw-image-file=*|-i=*)
+                DFILE="${arg#*=}"
+                NO_PROMPT="yes"
+            ;;
+
+            --partition-number=*|-p=*)
+                SPARTNB="${arg#*=}"
+                NO_PROMPT="yes"
+            ;;
+            
+            --destination-directory=*|-r=*)
+                DEST_DIR_ON_SD_CARD_PART="${arg#*=}"
+                NO_PROMPT="yes"
+            ;;
+            
+            --data=*|-d=*)
+                DIRORARCH="${arg#*=}"
+                NO_PROMPT="yes"
+            ;;        
+
+            --version|-v)
+                ver_info
+                NO_CLEANING="yes"
+                return 0
+            ;;
+            
+        esac
+    done
+    
+    
+    if [ -z ${DFILE} ]; then
+        echo -e "\nEnter path to raw-image file(*.sdcard) or tar archive with raw-image(*.tar.xz): "
+        read -e  -p ">" DFILE
     fi
+    
+    if [ ! -f "${DFILE}" ]; then
+        echo "1>${DFILE}"
+        echo -e "Error:File does not exist ! Exiting \n"
+        unset DFILE
+        return 2
+    fi
+            
+    if [[ ${DFILE} == *.tar.* ]]; then
+    
+      echo -e "\nExtracting Raw-Image from archive:\n ${DFILE##*/}:"
+      RAWIMGARCH_EXTRACT_DIR=$(mktemp -d)   
+      tar xf ${DFILE} -C ${RAWIMGARCH_EXTRACT_DIR} --checkpoint=.2000
+      i=0
+      for sdimg in ${RAWIMGARCH_EXTRACT_DIR}/*.sdcard; do
+          if [ ${i} -gt 1 ]; then
+             echo "Error: Archive have to include only one sdcard image"
+             return 3
+          else
+             echo -e "\nMoving sdcard file from temporary folder to current directory:"
+             #this takes too long in case that archive with image is located out of curdir fs, todo: optimalization 
+             mv -f "${sdimg}" ./
+             RAWIMAGEFILE="${sdimg##*/}"
+          fi
+          ((i+=$i+1))
+      done
+    
+    else
+        RAWIMAGEFILE="${DFILE}"
+    fi
+    
+    echo -e "\nRaw image file: ${RAWIMAGEFILE##*/}\n"
 
-    echo -e "\nSelect partition number[0-X]:"
-    fdisk -l ${RAWIMAGEFILE} | awk  '{ if(flg==1){print  i++ "  " $0}; if( match($0,"Device") ){flg=1; print "   " $0 }   }'
-    read -e  -p ">" SPARTNB
+    #TODO: Check partition table type, here we support only msdos(MBR):"Partition Table: msdos"
+    #      GPT and others have different tools for formating ....
+    #by tfs.sdcard: DOS/MBR boot sector; partition 1 : ID=0xc, start-CHS (0x40,0,1), end-CHS (0xbf,3,32), startsector 8192, 16384 sectors; partition 2 : ID=0x83, start-CHS (0xc0,0,1), end-CHS (0x3ff,3,32), startsector 24576, 2965504 sectors; partition 3 : #ID=0x83, start-CHS (0x3ff,3,32), end-CHS (0x3ff,3,32), startsector 2990080, 4194304 sectors
 
-    echo -e "\nEnter tar archive or some directory: "
-    read -e  -p ">" DIRORARCH
+    
+    
+    if [ -z ${SPARTNB} ]; then
+        echo -e "\nSelect partition number[1-X]:\n"
+        echo -e "    Partition\t\t Start\t\t End\t\t Size\t\t FS"
+    
+        parted -m ${RAWIMAGEFILE} print 2>/dev/null | awk 'BEGIN{ FS = ":" }FNR>2{ for(i=1;i<NF;i++){printf "\t"$i"\t"};print ""  }'
+        read -e  -p ">" SPARTNB
+    fi
+        
+    if [ -z ${DEST_DIR_ON_SD_CARD_PART} ]; then
+        echo -e "\nEnter destination directory on sd-card: "
+        read -e  -p ">" DEST_DIR_ON_SD_CARD_PART
+    fi
+    DEST_DIR_ON_SD_CARD_PART="${DEST_DIR_ON_SD_CARD_PART%/}"
+    
+    if [ -z ${DIRORARCH} ]; then    
+        echo -e "\nEnter tar archive or some directory to copy on sd-card: "
+        read -e  -p ">" DIRORARCH
+    fi
+    
     
     if [ ! -e "${DIRORARCH}" ]; then
         echo -e "Error:Archive or directory does not exist ! Exiting \n"
-        return 2
+        return 4
     fi
     
 
     tmp=$(fdisk -l ${RAWIMAGEFILE} | grep -i sector.*size.*: )
 
+    #NOTE; It is almost unecessary to detech sector size, because of almost all sd-cards/mmc use 512B/sec, but just for case of some obscure medium we may have bug,so it is better to read it. 
     secsize=${tmp##*/}
     secsize=${secsize//[!0-9]/}
-    startsec=$(fdisk -l ${RAWIMAGEFILE} | awk -v partn=${SPARTNB} '{ if(flg==1){if(i==partn){print $2};i++;}; if( match($0,"Device") ){flg=1; }   }')
-    LASTPARTN=$(fdisk -l ${RAWIMAGEFILE} | awk '{ if(flg==1){i++}; if( match($0,"Device.*Boot.*Start.*End.*Size") ){flg=1; }   }END{print i-1}')
-    STARTBYTESEC=$((${startsec}*${secsize}))
+    
+    startsec=$(parted -m ${RAWIMAGEFILE} unit s print 2>/dev/null | awk -v partn=${SPARTNB} 'BEGIN{ FS = ":" }FNR>2{ if($1==partn){ss=$2;sub(/s/,"",ss);print ss} }'  )
+    LASTPARTN=$(parted -m ${RAWIMAGEFILE} unit s print 2>/dev/null | awk 'BEGIN{ FS = ":" }END{ print $1}')
 
+    STARTBYTESEC=$((${startsec}*${secsize}))
     
     mountandcheckfreespace "${DIRORARCH}" "${RAWIMAGEFILE}" "${STARTBYTESEC}" "${MNTPOINT}" ret_expsize
-    
     _ret=$?
+    
+    copy2img="${RAWIMAGEFILE}"
     if [ ! "${_ret}" -eq 0 ]; then
     
-        echo -e "\nWarning: Not enought available space ! Another ${ret_expsize} MB is necessary on SD-CARD "
+        #1.25x resize 
+        expsize=$((${ret_expsize}*5/4))
         
-        if [ ! ${SPARTNB} -eq ${LASTPARTN} ]; then
-            echo -e "Error: This version supports expansion of raw-image only in case of last partition. Exiting \n"
-            return 3
+        echo -e "\nWarning: Insufficient partition space on sd-card image ! Another ${ret_expsize} MB is necessary on sd-card partition "
+        echo -e "\n Resize sd-card image ? [y/n]"
+        
+        if [ ${NO_PROMPT} == "yes" ]; then
+            yn="y"
         else
-            #expand last partition
-            
-            #1.25x resize 
-            expsize=$((${ret_expsize}*5/4))
-            
-            echo -e "\n Resize SD-CARD ? [y/n]"
-            
-            read -p " >" yn      
-            yn=${yn% *}; yn=${yn#* }
-            if [[ ${yn} =~ ^(y|Y|yes|Yes)$ ]]; then 
-            
+            read -p " >" yn 
+        fi
+        
+             
+        yn=${yn% *}; yn=${yn#* }
+        if [[ ${yn} =~ ^(y|Y|yes|Yes)$ ]]; then
+                
+                std tdtmp2
+                
+            if [ ! ${SPARTNB} -eq ${LASTPARTN} ]; then
+                #expand last partition
+                expanypart "${RAWIMAGEFILE}" "${expsize}" "${SPARTNB}" "${secsize}" "${LASTPARTN}"
+                _ret=$?
+                copy2img="${RAWIMG_1NEW}"
+            else
+                #expand last partition
                 explstpart "${RAWIMAGEFILE}" "${expsize}" "${LASTPARTN}"
                 _ret=$?
-                if [ ! ${_ret} -eq 0 ]; then
+                copy2img="${RAWIMAGEFILE}"
+            fi
+        else
+            return 6
+        fi
+        
+        if [ ! ${_ret} -eq 0 ]; then
                     echo -e "Error: Expandinf raw-image was not successful! Exiting \n"
                     return 4
-                fi
+        fi
                 
-                mountanddatacopy "${DIRORARCH}" "${MNTPOINT}" "${RAWIMAGEFILE}" "${STARTBYTESEC}"
-                _ret=$? 
-                [ ${_ret} -eq 0 ] && echo -e "\n>OK"
-                [ ! ${_ret} -eq 0 ] && echo -e "\n>ERROR" 
-                return 0
-                
-            else
-                return 6
-            fi
-        fi  
-  
-    else
-        #Plenty of space on raw-image
-        
-        mountanddatacopy "${DIRORARCH}" "${MNTPOINT}" "${RAWIMAGEFILE}" "${STARTBYTESEC}"
-        _ret=$? 
-        [ ${_ret} -eq 0 ] && echo -e "\n>OK"
-        [ ! ${_ret} -eq 0 ] && echo -e "\n>ERROR"
-        
-        return 0
-  
     fi
-    #mountandcheckfreespace
 
+    mountanddatacopy "${DIRORARCH}" "${MNTPOINT}" "${copy2img}" "${STARTBYTESEC}" "${DEST_DIR_ON_SD_CARD_PART}"
+    _ret=$? 
+    if [ ${_ret} -eq 0 ]; then
+      if [ ! ${SPARTNB} -eq ${LASTPARTN} ]; then
+        rm -f "${RAWIMAGEFILE}"
+        mv -f "${RAWIMG_1NEW}" "${RAWIMAGEFILE}"
+      fi
+      echo -e "\n>OK";
+      ptd ${tdtmp2}
+      return 0
+    fi
+    [ ! ${_ret} -eq 0 ] && { echo -e "\n>ERROR"; return 7; }; 
+    
 
 }
 
@@ -351,12 +768,15 @@ mountanddatacopy() {
     local _mntpoint=$2
     local _ddimgfile=$3
     local _startbytesec=$4
+    local _destdironpart=$5
     
     echo -e "\nMount:"
     sudo mount -o loop,offset="${_startbytesec}" "${_ddimgfile}" "${_mntpoint}"
     _ret=$?
     [ ! ${_ret} -eq 0 ] && return 1
     
+    #TODO: add user/group and ACLs to created folders, check  _destdironpart for weird  chars
+    [ ! -e "${_mntpoint}/${_destdironpart}" ] && sudo mkdir -p "${_mntpoint}/${_destdironpart}"
     
     if [ -d "${_fromarchiveordir}" ]; then
         echo -e "\nCopy data to raw image:"
@@ -364,18 +784,17 @@ mountanddatacopy() {
         frmtmp=${_fromarchiveordir%%/}/*
         #echo sudo cp -rf  "${frmtmp}" "${_mntpoint}"
         #read -p "  >" yn
-        sudo cp -rf  ${frmtmp} "${_mntpoint}"
+        sudo cp -rf  ${frmtmp} "${_mntpoint}/${_destdironpart}"
         _ret1=$?
         
     else
         echo -e "\nExtract archive to raw image:"
         #echo sudo tar -C "${_mntpoint}" -xvf "${_fromarchiveordir}"
         #read -p "  >" yn   
-        sudo tar -C "${_mntpoint}" -xvf "${_fromarchiveordir}"
+        sudo tar -C "${_mntpoint}/${_destdironpart}" -xvf "${_fromarchiveordir}"
         _ret1=$?
         
     fi
-
 
     if [ ! ${_ret1} -eq 0 ]; then
         echo -e "Error[$_ret1]: Copying was not successful! Exiting \n"
@@ -386,7 +805,7 @@ mountanddatacopy() {
         bla=$(sudo umount "${_mntpoint}")
         _ret=$?
         if [ ! ${_ret} -eq 0 ]; then
-            echo -e "\nError: sudo umount "${_mntpoint}""
+            echo -e "\nError: sudo umount: ""${_mntpoint}"
             return 3
         fi
     fi
@@ -395,4 +814,4 @@ mountanddatacopy() {
     return 0
 }
 
-main
+main "$@" 
