@@ -1,15 +1,10 @@
-#/bin/bash
+# #/bin/bash
 #====================================================================
 # NAME      :   ddim(DD Image Modificator)
 # AUTHOR    :   Andrys Jiri
-# DATE      :   2019.10.11
-VERSION='0.02'
+# DATE      :   2019.10.16
+VERSION='0.03'
 #
-# DEPENDENCIES :
-#               Binaries: bash, ls, mkdir, rmdir, cp, sudo, grep, egrep, 
-#                         awk, du, df, tar, 
-#                         losetup, kpartx, mount, dd, e2fsck, parted
-#                         fdisk
 #
 #
 # DESCRIPTION :
@@ -79,7 +74,7 @@ expanypart() {
     #partitions index 1-4, same as in parted
     local _lastpartn=$5
     
-    std tdtmp
+    #std tdtmp
     
     local _expsizeBytes=$((${_expsizeMB}*1024*1024))
      
@@ -103,9 +98,9 @@ expanypart() {
         sleep 1
     done
     
-    ptd ${tdtmp}
+    #ptd ${tdtmp}
     #echo "waiting ....."; read -p ">"
-    std tdtmp
+    #std tdtmp
     
     echo -e "\nExpanding partion [${_exppartnum}]: Step 2/8"
     
@@ -115,9 +110,9 @@ expanypart() {
     
     [ ! $? -eq 0 ] && { echo -e "ERROR: dd if=/dev/zero bs=${_secsize} count=${_expsizeS} status=progress >>${RAWIMG_0NEW} . \nExiting"; return 1; }
     
-    ptd ${tdtmp}    
+    #ptd ${tdtmp}    
     #echo "waiting ....."; read -p ">"
-    std tdtmp
+    #std tdtmp
     
     
     echo -e "\nExpanding partion [${_exppartnum}]: Step 3/8"
@@ -128,9 +123,9 @@ expanypart() {
     
     [ ! $? -eq 0 ] && { echo -e "ERROR: sudo parted ${RAWIMG_0NEW} resizepart ${_exppartnum} ${_exppartendB_new}B 2>/dev/null . \nExiting"; return 2; }
     
-    ptd ${tdtmp}
+    #ptd ${tdtmp}
     #echo "waiting ....."; read -p ">"
-    std tdtmp
+    #std tdtmp
     #ok
     
     
@@ -167,25 +162,6 @@ expanypart() {
     
     #ptd ${tdtmp}
     #std tdtmp    
-    
-    
-    #--------------------------------------------------------
-    #echo -e "\nExpanding partion [${_exppartnum}]: Step 5/9"
-    
-    #local _oldpartendB=$(parted -m ${_ddimgfile} unit B print 2>/dev/null | awk -v partn=${_exppartnum} 'BEGIN{ FS = ":" }FNR>2{ if($1==partn){ss=$3;sub(/B/,"",ss);print ss} }')
-    
-    #TODO: "bs" is too big ...  the malloc error issue can appear without detected error, same as before...?? !!
-    #TODO: Make some part of process such as this one in parallel with others .... 
-    #dd if=${_ddimgfile} of=${RAWIMG_2NEW} bs=$((${_oldpartendB}+1)) skip=1 conv=sparse status=progress 
-    
-    #[ ! $? -eq 0 ] && { echo -e "ERROR: dd if=${_ddimgfile} of=${RAWIMG_2NEW} bs=$((${_oldpartendB}+1)) skip=1 status=progress . \nExiting"; return 4; }
-    
-    
-    #ptd ${tdtmp}
-    #echo "waiting ....."; read -p ">"
-    #std tdtmp
-    #---------------------------------------------------------
-    
     
     echo -e "\nExpanding partion [${_exppartnum}]: Step 5/8"
     #14s 17s
@@ -227,9 +203,9 @@ expanypart() {
         #unset _pstart _psize _pend _pfs _loopn _mapperdev
     }
     
-    ptd ${tdtmp}
+    #ptd ${tdtmp}
     #echo "waiting ....."; read -p ">"
-    std tdtmp
+    #std tdtmp
     
     echo -e "\nExpanding partion [${_exppartnum}]: Step 6/8"
     #14s 16s
@@ -238,16 +214,21 @@ expanypart() {
     dd if=${RAWIMG_0NEW} of=${RAWIMG_1NEW} bs=$((${_secsize})) count=${_newpartendB}  conv=sparse status=progress
     sync
     
-    ptd ${tdtmp}
+    #ptd ${tdtmp}
     #echo "waiting ....."; read -p ">"
-    std tdtmp
+    #std tdtmp
     
     
     echo -e "\nExpanding partion [${_exppartnum}]: Step 7/8"
     
     echo "  Waiting for copying"
-    ws=$(<cpysync)
-    echo "  ->Finished"
+    ws=( $(<cpysync) )
+    if [ ! ${ws[0]} -eq 0 ]; then
+        echo "ERROR: Exiting"
+        return 7
+    fi
+    
+    echo "  ->OK, Finished"
     rm cpysync
     echo -e "\n  Joining images:"
     
@@ -256,8 +237,8 @@ expanypart() {
     #pv command is not installed on some distross, so its better to not to use it
     #pv ${RAWIMG_2NEW}>>${RAWIMG_1NEW}
     
-    ptd ${tdtmp}
-    std tdtmp
+    #ptd ${tdtmp}
+    #std tdtmp
     
     echo -e "\nExpanding partion [${_exppartnum}]: Step 8/8"
     
@@ -298,8 +279,8 @@ expanypart() {
 
     bla=$(sudo kpartx -dsv ${RAWIMG_1NEW} 2>/dev/null)
     
-    ptd ${tdtmp}
-    std tdtmp
+    #ptd ${tdtmp}
+    #std tdtmp
 
     return 0
     
@@ -478,6 +459,37 @@ mountandcheckfreespace() {
 }
 
 
+dependency_test() {
+  #format: all commands here are in format "CMDNAME SOME_PARAMETERS RETURN_VALUE"
+
+   for cmd in "${DEPENDENCIES_LIST[@]}"; do 
+    #
+    sub_cmd_arr=( ${cmd} )
+    lst="${#sub_cmd_arr[@]}"
+    sub_cmd="${sub_cmd_arr[@]:0:lst-1}"
+    cmd_only=${sub_cmd_arr[0]}
+    exp_retval="${sub_cmd_arr[@]: -1}"
+    #
+    
+    retval=$( ${sub_cmd} &>/dev/null)
+    retval=$?
+    if [ "${retval}" != "${exp_retval}" ] && [ "${retval}" != "0" ]; then
+      echo -e "  Error: Dependencies test fail !"
+      echo -e '         "'$sub_cmd'" command should return 0 or "'$exp_retval'"'"\n         but returned value is "'"'$retval'"!' 
+      return 1
+    fi
+   done
+
+  return 0
+}
+
+DEPENDENCIES_LIST=(  "date --help 0" "parted --help 0" "awk BEGIN{print} 0" "dd --help 0" \
+                     "cp --help 0" "rm --help 0" "kpartx -v 1" "e2fsck -V 0" "resize2fs --help 1" \
+                     "mkfs.ext4 -V 0" "mkfifo --version 0" "losetup --help 0" "du --help 0" "tar --help 0" \
+                     "df --help 0" "mount --help 0" "umount --help 0"  "rmdir --help 0" )
+
+
+
 
 
 trapclean(){
@@ -557,6 +569,11 @@ echo -e "\
   |
   |  >Data to copy on sd-card.
   |  >Tar archive(*.tar.???) or directory 
+  
+  
+  OPTION: --manual-change|-m
+  |
+  |  >Just mount selected partition, prompt user and let user change mounted partition manually 
 
 "
 }
@@ -571,16 +588,12 @@ RAWIMG_1NEW=0sdcard_m
 RAWIMG_2NEW=1sdcard
 NO_PROMPT="no"
 NO_CLEANING="no"
+MANUAL_CHANGE="no"
 
 main() {
 
     MNTPOINT=$(mktemp -d)
     
-    #This is just for smooth cleaning function, user would press another set of ctrl C or Z and stop cleaning task once sudo apears 
-    sudo echo 
-    
-    trap trapclean SIGTERM SIGHUP EXIT
-
     for arg in "$@"; do
         case "$arg" in
         
@@ -608,7 +621,11 @@ main() {
             --data=*|-d=*)
                 DIRORARCH="${arg#*=}"
                 NO_PROMPT="yes"
-            ;;        
+            ;;
+            
+            --manual-change|-m)
+                MANUAL_CHANGE="yes"
+            ;;
 
             --version|-v)
                 ver_info
@@ -618,6 +635,17 @@ main() {
             
         esac
     done
+    
+    dependency_test
+    _ret=$?
+    [ ! ${_ret} -eq 0 ] && return 1
+    
+    
+    #This is just for smooth cleaning function, user would press another set of ctrl C or Z and stop cleaning task once sudo apears 
+    sudo echo 
+    
+    trap trapclean SIGTERM SIGHUP EXIT
+
     
     
     if [ -z ${DFILE} ]; then
@@ -662,15 +690,25 @@ main() {
     #by tfs.sdcard: DOS/MBR boot sector; partition 1 : ID=0xc, start-CHS (0x40,0,1), end-CHS (0xbf,3,32), startsector 8192, 16384 sectors; partition 2 : ID=0x83, start-CHS (0xc0,0,1), end-CHS (0x3ff,3,32), startsector 24576, 2965504 sectors; partition 3 : #ID=0x83, start-CHS (0x3ff,3,32), end-CHS (0x3ff,3,32), startsector 2990080, 4194304 sectors
 
     
-    
     if [ -z ${SPARTNB} ]; then
-        echo -e "\nSelect partition number[1-X]:\n"
+        echo -e "\nSelect partition number[1-4]:\n"
         echo -e "    Partition\t\t Start\t\t End\t\t Size\t\t FS"
     
         parted -m ${RAWIMAGEFILE} print 2>/dev/null | awk 'BEGIN{ FS = ":" }FNR>2{ for(i=1;i<NF;i++){printf "\t"$i"\t"};print ""  }'
         read -e  -p ">" SPARTNB
     fi
-        
+    
+    
+    if [ ${MANUAL_CHANGE} == "yes" ]; then
+    
+        startsec=$(parted -m ${RAWIMAGEFILE} unit B print 2>/dev/null | awk -v partn=${SPARTNB} 'BEGIN{ FS = ":" }FNR>2{ if($1==partn){ss=$2;sub(/B/,"",ss);print ss} }'  )
+    
+        manualchange "${MNTPOINT}" "${RAWIMAGEFILE}" "${startsec}" ${SPARTNB}
+        _ret=$?
+        return ${_ret}
+    fi
+    #-----------------------------------
+    
     if [ -z ${DEST_DIR_ON_SD_CARD_PART} ]; then
         echo -e "\nEnter destination directory on sd-card: "
         read -e  -p ">" DEST_DIR_ON_SD_CARD_PART
@@ -728,7 +766,23 @@ main() {
                 #expand last partition
                 expanypart "${RAWIMAGEFILE}" "${expsize}" "${SPARTNB}" "${secsize}" "${LASTPARTN}"
                 _ret=$?
-                copy2img="${RAWIMG_1NEW}"
+                [ ! ${_ret} -eq 0 ] && return ${_ret}
+                
+                mountanddatacopy "${DIRORARCH}" "${MNTPOINT}" "${RAWIMG_1NEW}" "${STARTBYTESEC}" "${DEST_DIR_ON_SD_CARD_PART}"
+                _ret=$? 
+                if [ ${_ret} -eq 0 ]; then
+                    if [ ! ${SPARTNB} -eq ${LASTPARTN} ]; then
+                        rm -f "${RAWIMAGEFILE}"
+                        mv -f "${RAWIMG_1NEW}" "${RAWIMAGEFILE}"
+                    fi
+                    echo -e "\n>OK";
+                    #ptd ${tdtmp2}
+                    return 0
+                else
+                    echo -e "\n>ERROR";
+                    return 7;
+                fi
+                
             else
                 #expand last partition
                 explstpart "${RAWIMAGEFILE}" "${expsize}" "${LASTPARTN}"
@@ -749,19 +803,36 @@ main() {
     mountanddatacopy "${DIRORARCH}" "${MNTPOINT}" "${copy2img}" "${STARTBYTESEC}" "${DEST_DIR_ON_SD_CARD_PART}"
     _ret=$? 
     if [ ${_ret} -eq 0 ]; then
-      if [ ! ${SPARTNB} -eq ${LASTPARTN} ]; then
-        rm -f "${RAWIMAGEFILE}"
-        mv -f "${RAWIMG_1NEW}" "${RAWIMAGEFILE}"
-      fi
-      echo -e "\n>OK";
-      ptd ${tdtmp2}
-      return 0
+        echo -e "\n>OK";
+        return 0
+    else
+        echo -e "\n>ERROR"; 
+        return 7;
     fi
-    [ ! ${_ret} -eq 0 ] && { echo -e "\n>ERROR"; return 7; }; 
     
-
 }
 
+manualchange() {
+    local _mntpoint=$1
+    local _ddimgfile=$2
+    local _startbytesec=$3
+    local _exppartnum=$4
+
+    sudo mount -o loop,offset="${_startbytesec}" "${_ddimgfile}" "${_mntpoint}"
+    _ret=$?
+    [ ! ${_ret} -eq 0 ] && return 1
+    
+    echo -e "\nPartition ${_exppartnum} is mounted to: ${_mntpoint}"
+    echo -e "\nPress enter to umount:"
+    read -p "  >" yn
+    bla=$(sudo umount "${_mntpoint}")
+    _ret=$?
+    if [ ! ${_ret} -eq 0 ]; then
+        echo -e "\nError: sudo umount: ""${_mntpoint}"
+        return 3;
+    fi
+    return 0;
+}
 
 mountanddatacopy() {
     local _fromarchiveordir=$1
